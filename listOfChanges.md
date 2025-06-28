@@ -1,119 +1,110 @@
-
 # CHANGES.md
 
-## Multi-gNB support in `simulator.c`
+## 🚀 Multi-gNB support and simulator improvements
 
-These are all the exact changes made from `originalfile.txt` to the final working version of `simulator.c` that supports multiple gNBs in simulation mode.
+These are all the exact changes made from `originalfile.txt` to `newerSimulator.txt` to add support for **multiple gNBs**, refactor config parsing, and safely handle connection logic.
 
 ---
 
-### 1. 📌 Modified `RFSIMULATOR_PARAMS_DESC`
+### 1. 🧠 Updated `RFSIMULATOR_PARAMS_DESC` for multiple IPs
 
 **Original:**
 ```c
-{"serveraddr", "<ip address to connect to>\n", simOpt, .strptr=&rfsimulator->ip, .defstrval="127.0.0.1", TYPE_STRING, 0 },
+{"serveraddr", "<ip address to connect to>\n", simOpt,  .strptr=&rfsimulator->ip, ... TYPE_STRING, 0 },
 ```
 
 **Updated:**
-```c
-{"serveraddr", "<comma-separated list of IPs to connect to>\n", simOpt, .strlistptr=**tempIpListPtr, .defstrlistval=NULL, TYPE_STRINGLIST, 0 },
-```
-
-🔧 This allows the RF simulator to accept multiple `--rfsimulator.serveraddr` values instead of just one. We also changed the field from `strptr` to `strlistptr`, and `TYPE_STRING` to `TYPE_STRINGLIST`. The actual pointer is assigned later in `rfsimulator_readconfig()`.
-
----
-
-### 2. 📌 Added `ipList` and `ipListCount` to `rfsimulator_state_t`
-
-**Original:**
-```c
-typedef struct {
-  char *ip;
-  ...
-} rfsimulator_state_t;
-```
-
-**Updated:**
-```c
-typedef struct {
-  char *ip;
-  char **ipList;     // NEW: list of parsed IPs
-  int ipListCount;   // NEW: number of IPs
-  ...
-} rfsimulator_state_t;
-```
-
-💡 These fields are used to store the parsed string list and its length from the command-line `--rfsimulator.serveraddr`. The simulator can now loop over each IP and attempt a connection.
-
----
-
-### 3. 📌 Added static `tempIpListPtr` for config parser to write into
-
-**Added globally (top of file):**
 ```c
 static char **tempIpListPtr = NULL;
-```
-
-📥 Because the config system initializes statically before `rfsimulator` exists, we need a temporary global variable to hold the parsed IP list before copying it into the struct.
-
----
-
-### 4. 📌 Modified `rfsimulator_readconfig()` to use `ipList`
-
-**Changes inside `rfsimulator_readconfig()`:**
-```c
-int serverAddrIdx = config_paramidx_fromname(rfsimu_params, sizeofArray(rfsimu_params), "serveraddr");
-rfsimu_params[serverAddrIdx].strlistptr = &tempIpListPtr;
 
 ...
 
-rfsimulator->ipList = tempIpListPtr;
-rfsimulator->ipListCount = rfsimu_params[serverAddrIdx].numelt;
+{"serveraddr", "<comma-separated list of IPs to connect to>\n", simOpt, .strlistptr=tempIpListPtr, ... TYPE_STRINGLIST, 0 },
 ```
 
-🧠 This sets up the config parser to store the IP list into `tempIpListPtr`, then transfers it to the actual `rfsimulator` struct after parsing.
+🔍 This replaces the single `ip` pointer with a string list to allow multiple gNB IPs via comma-separated input.
 
 ---
 
-### 5. 📌 Rewrote `startClient()` to loop over multiple IPs
+### 2. 📦 New fields in `rfsimulator_state_t`
+
+**Original:**
+```c
+typedef struct {
+  char *ip;
+  ...
+} rfsimulator_state_t;
+```
+
+**Updated:**
+```c
+typedef struct {
+  char **ipList;
+  int ipListCount;
+  char *ip;
+  ...
+} rfsimulator_state_t;
+```
+
+📥 `ipList` holds the list of parsed IPs, and `ipListCount` tells us how many there are.
+
+---
+
+### 3. 🛠 Rewrote `rfsimulator_readconfig()` logic
+
+**Added:**
+- Parses `--rfsimulator.serveraddr` as a string list using `strlistptr`
+- Adds fallback support for the `RFSIMULATOR` environment variable
+- Uses `strncasecmp()` with null checks for safety
+- Sets role to SERVER only if IP starts with `server` or `enb`, else CLIENT
+
+🔐 **Null-safe and fault-tolerant.** Now it doesn’t crash if IP list is missing.
+
+---
+
+### 4. 🔁 Rewrote `startClient()` to loop over IP list
 
 **Original:**
 ```c
 addr.sin_addr.s_addr = inet_addr(t->ip);
-...
 connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+allocCirBuf(t, sock);
 ```
 
 **Updated:**
 ```c
 for (int i = 0; i < t->ipListCount; i++) {
-  if (t->ipList[i] == NULL) continue;
-
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  ...
   addr.sin_addr.s_addr = inet_addr(t->ipList[i]);
-
-  while (!connected) {
-    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    ...
-  }
-
-  setblocking(sock, notBlocking);
+  connect(sock, ...);
   allocCirBuf(t, sock);
 }
 ```
 
-🔄 This loops through all the IPs from the command line, connects to each gNB one by one, and allocates a circular buffer for each socket.
+🚀 Now the client connects to *every* gNB IP in the list, allocating buffers per socket.
 
 ---
 
-### 6. 📌 Added Debug Logs
+### 5. 🧪 Added Debug Logs for Multi-gNB Mode
 
-**New log examples:**
+New logs like:
 ```c
-LOG_I(HW, "[ASHAY] ipListCount = %d\n", t->ipListCount);
-LOG_I(HW, "[ASHAY] Trying to connect to gNB #%d at %s:%d\n", i, t->ipList[i], t->port);
+LOG_I(HW, "[ASHAY] ipList[%d] = %s\n", i, t->ipList[i]);
 LOG_E(HW, "[ASHAY] ipList[%d] is NULL! Skipping...\n", i);
+LOG_I(HW, "[ASHAY] Trying to connect to gNB #%d at %s:%d\n", i, t->ipList[i], t->port);
 ```
 
-🧪 These logs appear during container boot to confirm that multi-gNB parsing and connection logic are working.
+🔎 Helps track exactly which IPs are being used and where connection fails.
+
+---
+
+### 6. 🔧 Minor Fixes and Quality Improvements
+
+- 💣 Segfault-prone checks in `rfsimulator_readconfig()` now safely fall back if `ipList` is null or empty.
+- 🧹 Changed config macro: `strlistptr = tempIpListPtr` (no `&` used).
+- 🛡 `char *env = getenv(...)` moved inside function scope to reduce global leakage.
+
+---
+
+### ✅ Final Touches
+
+You’ve made the simulator robust, scalable for multi-gNB setups, and safe against invalid inputs. Very solid engineering, Ashay! 💪
