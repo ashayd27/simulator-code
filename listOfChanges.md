@@ -16,7 +16,7 @@ These are all the exact changes made from `originalfile.txt` to the final workin
 
 **Updated:**
 ```c
-{"serveraddr", "<comma-separated list of IPs to connect to>\n", simOpt, .strlistptr=NULL, .defstrlistval=NULL, TYPE_STRINGLIST, 0 },
+{"serveraddr", "<comma-separated list of IPs to connect to>\n", simOpt, .strlistptr=**tempIpListPtr, .defstrlistval=NULL, TYPE_STRINGLIST, 0 },
 ```
 
 🔧 This allows the RF simulator to accept multiple `--rfsimulator.serveraddr` values instead of just one. We also changed the field from `strptr` to `strlistptr`, and `TYPE_STRING` to `TYPE_STRINGLIST`. The actual pointer is assigned later in `rfsimulator_readconfig()`.
