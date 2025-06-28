@@ -108,7 +108,7 @@ typedef enum { SIMU_ROLE_SERVER = 1, SIMU_ROLE_CLIENT } simuRole;
 
 static char **tempIpListPtr = NULL;
 #define RFSIMULATOR_PARAMS_DESC {					\
-    {"serveraddr",             "<comma-separated list of IPs to connect to>\n",        simOpt,  .strlistptr=**tempIpListPtr,               .defstrlistval=NULL,           TYPE_STRINGLIST,    0 },\
+    {"serveraddr",             "<comma-separated list of IPs to connect to>\n",        simOpt,  .strlistptr=tempIpListPtr,               .defstrlistval=NULL,           TYPE_STRINGLIST,    0 },\
     {"serverport",             "<port to connect to>\n",              simOpt,  .u16ptr=&(rfsimulator->port),           .defuintval=PORT,                 TYPE_UINT16,    0 },\
     {RFSIMU_OPTIONS_PARAMNAME, RFSIM_CONFIG_HELP_OPTIONS,             0,       .strlistptr=NULL,                       .defstrlistval=NULL,              TYPE_STRINGLIST,0 },\
     {"IQfile",                 "<file path to use when saving IQs>\n",simOpt,  .strptr=&saveF,                         .defstrval="/tmp/rfsimulator.iqs",TYPE_STRING,    0 },\
@@ -323,12 +323,12 @@ static void fullwrite(int fd, void *_buf, ssize_t count, rfsimulator_state_t *t)
 }
 
 static void rfsimulator_readconfig(rfsimulator_state_t *rfsimulator) {
-  char *saveF=NULL;
-  char *modelname=NULL;
+  char *saveF = NULL;
+  char *modelname = NULL;
   paramdef_t rfsimu_params[] = RFSIMULATOR_PARAMS_DESC;
 
   int serverAddrIdx = config_paramidx_fromname(rfsimu_params, sizeofArray(rfsimu_params), "serveraddr");
-  rfsimu_params[serverAddrIdx].strlistptr = &tempIpListPtr;
+  rfsimu_params[serverAddrIdx].strlistptr = tempIpListPtr;  // Removed &
 
   int p = config_paramidx_fromname(rfsimu_params, sizeofArray(rfsimu_params), RFSIMU_OPTIONS_PARAMNAME);
   int ret = config_get(config_get_if(), rfsimu_params, sizeofArray(rfsimu_params), RFSIMU_SECTION);
@@ -339,41 +339,37 @@ static void rfsimulator_readconfig(rfsimulator_state_t *rfsimulator) {
 
   rfsimulator->saveIQfile = -1;
 
-  for(int i=0; i<rfsimu_params[p].numelt ; i++) {
-    if (strcmp(rfsimu_params[p].strlistptr[i],"saviq") == 0) {
-      rfsimulator->saveIQfile=open(saveF,O_APPEND| O_CREAT|O_TRUNC | O_WRONLY, 0666);
+  /* Fallback: get server IPs from RFSIMULATOR env variable */
+  char *env = getenv("RFSIMULATOR");  // Moved inside function
+  if (env != NULL) {
+    LOG_W(HW, "[ASHAY] Using fallback RFSIMULATOR env variable: %s", env);
 
-      if ( rfsimulator->saveIQfile != -1 )
-        LOG_I(HW, "Will save written IQ samples in %s\n", saveF);
-      else {
-        LOG_E(HW, "open(%s) failed for IQ saving, errno(%d)\n", saveF, errno);
-        exit(-1);
-      }
+    // Make a copy because strtok modifies the string
+    char *copy = strdup(env);
+    char *token = strtok(copy, ",");
+    int count = 0;
 
-      break;
-    } else if (strcmp(rfsimu_params[p].strlistptr[i],"chanmod") == 0) {
-      init_channelmod();
-      load_channellist(rfsimulator->tx_num_channels, rfsimulator->rx_num_channels, rfsimulator->sample_rate, rfsimulator->tx_bw);
-      rfsimulator->channelmod=true;
-    } else {
-      fprintf(stderr, "unknown rfsimulator option: %s\n", rfsimu_params[p].strlistptr[i]);
-      exit(-1);
+    static char *envIpList[16];  // max 16 gNBs
+    while (token && count < 16) {
+      envIpList[count++] = strdup(token);
+      token = strtok(NULL, ",");
     }
+
+    rfsimulator->ipList = envIpList;
+    rfsimulator->ipListCount = count;
+
+    free(copy);
   }
 
-  /* for compatibility keep environment variable usage */
-  if ( getenv("RFSIMULATOR") != NULL ) {
-    rfsimulator->ip=getenv("RFSIMULATOR");
-    LOG_W(HW, "The RFSIMULATOR environment variable is deprecated and support will be removed in the future. Instead, add parameter --rfsimulator.serveraddr %s to set the server address. Note: the default is \"server\"; for the gNB/eNB, you don't have to set any configuration.\n", rfsimulator->ip);
-    LOG_I(HW, "Remove RFSIMULATOR environment variable to get rid of this message and the sleep.\n");
-    sleep(10);
-  }
-
-  if ( strncasecmp(rfsimulator->ip,"enb",3) == 0 ||
-       strncasecmp(rfsimulator->ip,"server",3) == 0 )
-    rfsimulator->role = SIMU_ROLE_SERVER;
-  else
+  if (rfsimulator->ipList == NULL || rfsimulator->ipListCount == 0 || rfsimulator->ipList[0] == NULL) {
+    LOG_W(HW, "[ASHAY] ipList is not valid! Defaulting to CLIENT role.");
     rfsimulator->role = SIMU_ROLE_CLIENT;
+  } else if (strncasecmp(rfsimulator->ipList[0], "enb", 3) == 0 ||
+            strncasecmp(rfsimulator->ipList[0], "server", 6) == 0) {
+    rfsimulator->role = SIMU_ROLE_SERVER;
+  } else {
+    rfsimulator->role = SIMU_ROLE_CLIENT;
+  }
 }
 
 static int rfsimu_setchanmod_cmd(char *buff, int debug, telnet_printfunc_t prnt, void *arg) {
@@ -1007,6 +1003,7 @@ static int rfsimulator_write_init(openair0_device *device) {
   return 0;
 }
 __attribute__((__visibility__("default")))
+
 int device_init(openair0_device *device, openair0_config_t *openair0_cfg) {
   // to change the log level, use this on command line
   // --log_config.hw_log_level debug
