@@ -71,6 +71,7 @@
 #define byteToSample(a,b) ((a)/(sizeof(sample_t)*(b)))
 
 #define GENERATE_CHANNEL 10 // each frame (or slot?) in DL
+#define MAX_GNBS 2 // maximum number of gnbs to support
 
 // This needs to be re-architected in the future
 //
@@ -155,11 +156,14 @@ typedef struct buffer_s {
   char *circularBufEnd;
   sample_t *circularBuf;
   channel_desc_t *channel_model;
+  bool ssbDetected;
+  openair0_timestamp ssbFirstRxTstamp;
 } buffer_t;
 
 typedef struct {
   char **ipList;        // List of IP addresses
   int ipListCount;      // Number of IPs
+  int sockets[MAX_GNBS]; // Max number of GNB Sockets
   int listen_sock, epollfd;
   openair0_timestamp nextRxTstamp;
   openair0_timestamp lastWroteTS;
@@ -601,36 +605,41 @@ static int startClient(openair0_device *device) {
 
     struct sockaddr_in addr = {
       .sin_family = AF_INET,
-      .sin_port = htons(t->port)
+      .sin_port = htons(t->port),
+      .sin_addr.s_addr = inet_addr(t->ipList[i])
     };
-
-    addr.sin_addr.s_addr = inet_addr(t->ipList[i]);
 
     bool connected = false;
     while (!connected) {
       LOG_I(HW, "[ASHAY] Trying to connect to gNB #%d at %s:%d\n", i, t->ipList[i], t->port);
       if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
         LOG_I(HW, "[ASHAY] Connection to gNB #%d at %s:%d established\n", i, t->ipList[i], t->port);
+
+        if (setblocking(sock, notBlocking) == -1) {
+          LOG_E(HW, "[ASHAY] setblocking() failed for gNB #%d, closing socket\n", i);
+          close(sock);
+          break;
+        }
+
+        if (allocCirBuf(t, sock) < 0) {
+          LOG_E(HW, "[ASHAY] allocCirBuf() failed for gNB #%d, closing socket\n", i);
+          close(sock);
+          break;
+        }
+
+        t->sockets[i] = sock; // 💾 Store socket for future use
+        LOG_I(HW, "[ASHAY] Socket #%d stored in t->sockets[%d]\n", sock, i);
         connected = true;
+
       } else {
-        LOG_W(HW, "[ASHAY] connect() to gNB #%d (%s:%d) failed, retrying... errno(%d)\n",
+        LOG_W(HW, "[ASHAY] connect() to gNB #%d (%s:%d) failed, retrying in 1s... errno(%d)\n",
               i, t->ipList[i], t->port, errno);
         sleep(1);
       }
     }
-
-    if (setblocking(sock, notBlocking) == -1) {
-      LOG_E(HW, "[ASHAY] setblocking() failed for gNB #%d\n", i);
-      continue;
-    }
-
-    if (allocCirBuf(t, sock) < 0) {
-      LOG_E(HW, "[ASHAY] allocCirBuf() failed for gNB #%d\n", i);
-      continue;
-    }
   }
 
-  return 0; // Success if we tried all gNBs
+  return 0;
 }
 
 static int rfsimulator_write_internal(rfsimulator_state_t *t, openair0_timestamp timestamp, void **samplesVoid, int nsamps, int nbAnt, int flags, bool alreadyLocked) {
@@ -846,132 +855,116 @@ static bool flushInput(rfsimulator_state_t *t, int timeout, int nsamps_for_initi
   return nfds>0;
 }
 
-static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimestamp, void **samplesVoid, int nsamps, int nbAnt)
-{
+static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimestamp, void **samplesVoid, int nsamps, int nbAnt) {
   rfsimulator_state_t *t = device->priv;
-  LOG_D(HW, "Enter rfsimulator_read, expect %d samples, will release at TS: %ld, nbAnt %d\n", nsamps, t->nextRxTstamp+nsamps, nbAnt);
+  LOG_D(HW, "Enter rfsimulator_read, expect %d samples, will release at TS: %ld, nbAnt %d\n", nsamps, t->nextRxTstamp + nsamps, nbAnt);
 
-  // deliver data from received data
-  // check if a UE is connected
   int first_sock;
-
   for (first_sock = 0; first_sock < MAX_FD_RFSIMU; first_sock++)
-    if (t->buf[first_sock].circularBuf != NULL )
+    if (t->buf[first_sock].circularBuf != NULL)
       break;
 
   if (first_sock == MAX_FD_RFSIMU) {
-    // no connected device (we are eNB, no UE is connected)
-    if ( t->nextRxTstamp == 0)
+    if (t->nextRxTstamp == 0)
       LOG_I(HW, "No connected device, generating void samples...\n");
 
-    if (!flushInput(t, t->wait_timeout,  nsamps)) {
-      for (int x=0; x < nbAnt; x++)
-        memset(samplesVoid[x],0,sampleToByte(nsamps,1));
-
-      t->nextRxTstamp+=nsamps;
-
-      if ( ((t->nextRxTstamp/nsamps)%100) == 0)
+    if (!flushInput(t, t->wait_timeout, nsamps)) {
+      for (int x = 0; x < nbAnt; x++)
+        memset(samplesVoid[x], 0, sampleToByte(nsamps, 1));
+      t->nextRxTstamp += nsamps;
+      if (((t->nextRxTstamp / nsamps) % 100) == 0)
         LOG_D(HW, "No UE, Generating void samples for Rx: %ld\n", t->nextRxTstamp);
-
-      *ptimestamp = t->nextRxTstamp-nsamps;
+      *ptimestamp = t->nextRxTstamp - nsamps;
       return nsamps;
     }
   } else {
     bool have_to_wait;
-
     do {
-      have_to_wait=false;
-
+      have_to_wait = false;
       buffer_t *b = NULL;
       for (int sock = 0; sock < MAX_FD_RFSIMU; sock++) {
         b = &t->buf[sock];
-
-        if ( b->circularBuf )
-          if ( t->nextRxTstamp+nsamps > b->lastReceivedTS ) {
-            have_to_wait=true;
-            break;
-          }
+        if (b->circularBuf && t->nextRxTstamp + nsamps > b->lastReceivedTS) {
+          have_to_wait = true;
+          break;
+        }
       }
-
       if (have_to_wait) {
-        LOG_D(HW,
-              "Waiting on socket, current last ts: %ld, expected at least : %ld\n",
-              b->lastReceivedTS,
-              t->nextRxTstamp + nsamps);
+        LOG_D(HW, "Waiting on socket, current last ts: %ld, expected at least: %ld\n", b->lastReceivedTS, t->nextRxTstamp + nsamps);
         flushInput(t, 3, nsamps);
       }
     } while (have_to_wait);
   }
 
-  // Clear the output buffer
-  for (int a=0; a<nbAnt; a++)
-    memset(samplesVoid[a],0,sampleToByte(nsamps,1));
+  for (int a = 0; a < nbAnt; a++)
+    memset(samplesVoid[a], 0, sampleToByte(nsamps, 1));
 
-  // Add all input nodes signal in the output buffer
   for (int sock = 0; sock < MAX_FD_RFSIMU; sock++) {
-    buffer_t *ptr=&t->buf[sock];
+    buffer_t *ptr = &t->buf[sock];
+    if (!ptr->circularBuf)
+      continue;
 
-    if ( ptr->circularBuf ) {
-      bool reGenerateChannel=false;
+    for (int a = 0; a < nbAnt; a++) {
+      int nbAnt_tx = ptr->th.nbAnt;
+      int firstIndex = (CirSize + t->nextRxTstamp - t->chan_offset) % CirSize;
+      sample_t *out = (sample_t *)samplesVoid[a];
 
-      //fixme: when do we regenerate
-      // it seems legacy behavior is: never in UL, each frame in DL
-      if (reGenerateChannel)
-        random_channel(ptr->channel_model,0);
-
-      if (t->poll_telnetcmdq)
-        t->poll_telnetcmdq(t->telnetcmd_qid,t);
-
-      for (int a=0; a<nbAnt; a++) {//loop over number of Rx antennas
-        if ( ptr->channel_model != NULL ) { // apply a channel model
-          rxAddInput(ptr->circularBuf, (c16_t *) samplesVoid[a],
-                     a,
-                     ptr->channel_model,
-                     nsamps,
-                     t->nextRxTstamp,
-                     CirSize);
+      // First SSB detection logic
+      if (!ptr->ssbDetected) {
+        for (int s = 0; s < nsamps; s++) {
+          sample_t samp = ptr->circularBuf[(firstIndex + s) % CirSize];
+          if (samp.r != 0 || samp.i != 0) {
+            ptr->ssbDetected = true;
+            ptr->ssbFirstRxTstamp = t->nextRxTstamp + s;
+            LOG_W(HW, "[ASHAY] First signal from gNB #%d detected at timestamp %ld (sample offset %d)\n", sock, ptr->ssbFirstRxTstamp, s);
+            break;
+          }
         }
-        else { // no channel modeling
-          int nbAnt_tx = ptr->th.nbAnt; // number of Tx antennas
-          int firstIndex = (CirSize + t->nextRxTstamp - t->chan_offset) % CirSize;
-          sample_t *out = (sample_t *)samplesVoid[a];
-          if ((nbAnt_tx == 1) && ((nb_ue == 1) || (t->role == SIMU_ROLE_CLIENT))) { // optimized for 1 Tx and 1 UE
-            sample_t *firstSample = (sample_t *)&(ptr->circularBuf[firstIndex]);
-            if (firstIndex + nsamps > CirSize) {
-              int tailSz = CirSize - firstIndex;
-              memcpy(out, firstSample, sampleToByte(tailSz, 1));
-              memcpy(out + tailSz, &ptr->circularBuf[0], sampleToByte(nsamps - tailSz, 1));
-            } else {
-              memcpy(out, firstSample, sampleToByte(nsamps, 1));
-            }
-          } else {
-            // SIMD (with simde) optimization might be added here later
-            double H_awgn_mimo[4][4] = {{1.0, 0.2, 0.1, 0.05}, // rx 0
-                                        {0.2, 1.0, 0.2, 0.1}, // rx 1
-                                        {0.1, 0.2, 1.0, 0.2}, // rx 2
-                                        {0.05, 0.1, 0.2, 1.0}}; // rx 3
+      }
 
-            LOG_D(HW, "nbAnt_tx %d\n", nbAnt_tx);
-            for (int i = 0; i < nsamps; i++) { // loop over nsamps
-              for (int a_tx = 0; a_tx < nbAnt_tx; a_tx++) { // sum up signals from nbAnt_tx antennas
-                out[i].r += (short)(ptr->circularBuf[((firstIndex + i) * nbAnt_tx + a_tx) % CirSize].r * H_awgn_mimo[a][a_tx]);
-                out[i].i += (short)(ptr->circularBuf[((firstIndex + i) * nbAnt_tx + a_tx) % CirSize].i * H_awgn_mimo[a][a_tx]);
-              } // end for a_tx
-            } // end for i (number of samps)
-          } // end of 1 tx antenna optimization
-        } // end of no channel modeling
-      } // end for a (number of rx antennas)
+      if (nbAnt_tx == 1 && ((nb_ue == 1) || (t->role == SIMU_ROLE_CLIENT))) {
+        sample_t *firstSample = (sample_t *)&(ptr->circularBuf[firstIndex]);
+        if (firstIndex + nsamps > CirSize) {
+          int tailSz = CirSize - firstIndex;
+          memcpy(out, firstSample, sampleToByte(tailSz, 1));
+          memcpy(out + tailSz, &ptr->circularBuf[0], sampleToByte(nsamps - tailSz, 1));
+        } else {
+          memcpy(out, firstSample, sampleToByte(nsamps, 1));
+        }
+      } else {
+        double H_awgn_mimo[4][4] = {
+          {1.0, 0.2, 0.1, 0.05},
+          {0.2, 1.0, 0.2, 0.1},
+          {0.1, 0.2, 1.0, 0.2},
+          {0.05, 0.1, 0.2, 1.0}
+        };
+        for (int i = 0; i < nsamps; i++) {
+          for (int a_tx = 0; a_tx < nbAnt_tx; a_tx++) {
+            out[i].r += (short)(ptr->circularBuf[((firstIndex + i) * nbAnt_tx + a_tx) % CirSize].r * H_awgn_mimo[a][a_tx]);
+            out[i].i += (short)(ptr->circularBuf[((firstIndex + i) * nbAnt_tx + a_tx) % CirSize].i * H_awgn_mimo[a][a_tx]);
+          }
+        }
+      }
     }
   }
 
-  *ptimestamp = t->nextRxTstamp; // return the time of the first sample
-  t->nextRxTstamp+=nsamps;
-  LOG_D(HW,
-        "Rx to upper layer: %d from %ld to %ld, energy in first antenna %d\n",
-        nsamps,
-        *ptimestamp,
-        t->nextRxTstamp,
-        signal_energy(samplesVoid[0], nsamps));
+  *ptimestamp = t->nextRxTstamp;
+  t->nextRxTstamp += nsamps;
+
+  // Sample offset logging
+  int referenceSock = -1;
+  for (int i = 0; i < MAX_FD_RFSIMU; i++) {
+    if (t->buf[i].ssbDetected) {
+      if (referenceSock == -1) {
+        referenceSock = i;
+      } else {
+        long delta = t->buf[i].ssbFirstRxTstamp - t->buf[referenceSock].ssbFirstRxTstamp;
+        LOG_A(HW, "[ASHAY] Δsample offset between gNB #%d and gNB #%d = %ld samples\n", referenceSock, i, delta);
+      }
+    }
+  }
+
+  LOG_D(HW, "Rx to upper layer: %d from %ld to %ld, energy in first antenna %d\n", nsamps, *ptimestamp, t->nextRxTstamp, signal_energy(samplesVoid[0], nsamps));
   return nsamps;
 }
 
